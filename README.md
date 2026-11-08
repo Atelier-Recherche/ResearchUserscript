@@ -1,4 +1,42 @@
-# AT Research Userscripts
+<div align="center" id="head">
+
+<table>
+<tr>
+<td><img src="readme-media/logo_researchuserscript.png" alt="ResearchUserscript" width="140" /></td>
+<td align="left">
+<h1 style="margin:0">ResearchUserscript</h1>
+<p style="margin:0.25em 0 0"><strong>Userscripts pour la recherche</strong><br/>Cairn · Tampermonkey · Violentmonkey</p>
+</td>
+</tr>
+</table>
+
+<a href="https://atelier.atechnologie.fr/" title="l'Atelier – Association de fabrication de livres et d'outils de recherche"><img src="https://raw.githubusercontent.com/Atelier-Recherche/.github/main/profile/logo.jpg" alt="l'Atelier" width="200" /></a>  
+<sub>Développé par <a href="https://atelier.atechnologie.fr/">l'Atelier</a> — fabrication de livres et outils de recherche (EHESS)</sub>
+
+<p>
+🇫🇷 <a href="README.md"><b>Français</b></a> ·
+🇬🇧 <a href="README.en.md">English</a> ·
+🇩🇪 <a href="README.de.md">Deutsch</a> ·
+🇪🇸 <a href="README.es.md">Español</a>
+</p>
+
+<p>
+<a href="https://atelier.atechnologie.fr/"><img src="https://img.shields.io/badge/🌐_l'Atelier-atelier.atechnologie.fr-2d5016?style=for-the-badge" alt="Site l'Atelier" /></a>
+<a href="https://github.com/Atelier-Recherche/ResearchUserscript"><img src="https://img.shields.io/badge/📦_Dépôt-GitHub-181717?style=for-the-badge&logo=github" alt="Dépôt GitHub" /></a>
+</p>
+
+</div>
+
+---
+
+## 📸 Aperçu
+
+| Cairn | Téléchargement |
+| :---: | :---: |
+| <img src="readme-media/screen1.jpg" alt="Cairn" width="400" /> | <img src="readme-media/screen2.jpg" alt="Téléchargement" width="400" /> |
+
+---
+## 📖 À propos
 
 Collection de **userscripts** destinés aux chercheurs, doctorants et étudiants en sciences humaines et sociales. Chaque script automatise une tâche répétitive sur une plateforme académique (téléchargement, navigation, export…), sans remplacer l’accès légitime aux contenus.
 
@@ -6,7 +44,7 @@ Collection de **userscripts** destinés aux chercheurs, doctorants et étudiants
 
 ---
 
-## Installation rapide
+## ⬇️ Installation rapide
 
 1. Installez Tampermonkey ou Violentmonkey dans votre navigateur.
 2. Ouvrez le fichier `.user.js` du script souhaité (ou cliquez sur le lien *Installer* ci-dessous).
@@ -15,7 +53,7 @@ Collection de **userscripts** destinés aux chercheurs, doctorants et étudiants
 
 ---
 
-## Scripts disponibles
+## 📜 Scripts disponibles
 
 | Script | Plateforme | Description | Installer |
 |--------|------------|-------------|-----------|
@@ -48,7 +86,7 @@ Sur la page d’un **livre ou dossier en libre accès** sur Cairn, un bouton *T�
 
 ---
 
-## Structure du dépôt
+## 📁 Structure du dépôt
 
 ```
 ATResearchUserscript/
@@ -60,7 +98,7 @@ Les fichiers `*.nomerge.js` / `*.debugmerge.js` éventuels sont des variantes de
 
 ---
 
-## Contribuer
+## 🤝 Contribuer
 
 Les contributions sont les bienvenues : nouveau userscript, correction, amélioration d’UI ou de compatibilité.
 
@@ -74,12 +112,19 @@ Idées de domaines utiles : Persée, OpenEdition, Gallica, HAL, Google Scholar, 
 
 ---
 
-## Avertissement
+## ⚠️ Avertissement
 
 Ces outils sont fournis **tels quels**, à des fins de recherche et de confort d’usage. Respectez les conditions d’utilisation des sites concernés, le droit d’auteur et les licences des documents. L’auteur du dépôt n’est pas affilié à Cairn.info ni aux plateformes ciblées.
 
 ---
 
-## Licence
+## 📄 Licence
 
 À préciser (MIT ou autre) selon votre choix avant publication publique.
+
+---
+
+## 🌐 Liens
+
+- 🌐 [l’Atelier](https://atelier.atechnologie.fr/)
+- 📦 [Dépôt GitHub](https://github.com/Atelier-Recherche/ResearchUserscript)
