@@ -57,13 +57,13 @@ Collection de **userscripts** destinés aux chercheurs, doctorants et étudiants
 
 | Script | Plateforme | Description | Installer |
 |--------|------------|-------------|-----------|
-| **Cairn PDF Downloader** | [Cairn.info](https://www.cairn.info/) / [shs.cairn.info](https://shs.cairn.info/) | Télécharge tous les PDF des chapitres d’un ouvrage en libre accès, avec option de fusion en un seul fichier | [`cairn-pdf-downloader.user.js`](./cairn-pdf-downloader.user.js) |
+| **Cairn PDF Downloader** | [Cairn.info](https://www.cairn.info/) / [shs.cairn.info](https://shs.cairn.info/) | Télécharge tous les PDF des chapitres/articles d’un ouvrage ou d’une revue en libre accès, avec option de fusion en un seul fichier | [`cairn-pdf-downloader.user.js`](./cairn-pdf-downloader.user.js) |
 
 ---
 
 ### Cairn PDF Downloader
 
-Sur la page d’un **livre ou dossier en libre accès** sur Cairn, un bouton *Télécharger tous les chapitres* apparaît en haut à droite.
+Sur la page d’un **livre, dossier ou numéro de revue en libre accès** sur Cairn, un bouton *Télécharger tous les chapitres* apparaît en haut à droite.
 
 **Fonctionnalités**
 

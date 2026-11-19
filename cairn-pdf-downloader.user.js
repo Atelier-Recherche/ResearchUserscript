@@ -1,18 +1,17 @@
 // ==UserScript==
 // @name         Cairn PDF Downloader
 // @namespace    http://tampermonkey.net/
-// @version      1.1
-// @description  Télécharge tous les PDFs des chapitres d'un livre Cairn en libre accès et peut les fusionner en un seul PDF
+// @version      1.7
+// @description  Télécharge et fusionne en un PDF tous les chapitres/articles d'un livre ou d'une revue Cairn
 // @author       You
 // @match        https://shs.cairn.info/*
 // @match        https://*.cairn.info/*
-// @grant        GM_xmlhttpRequest
 // @grant        GM_download
-// @grant        GM_setValue
-// @grant        GM_getValue
-// @grant        GM_getResourceURL
+// @grant        GM_xmlhttpRequest
+// @grant        unsafeWindow
 // @connect      cairn.info
 // @connect      shs.cairn.info
+// @connect      www.cairn.info
 // @connect      cdn.jsdelivr.net
 // @connect      unpkg.com
 // ==/UserScript==
@@ -41,134 +40,233 @@
         return parent ? parent.getAttribute('x-alt-clipboard') : null;
     }
 
-    // Fonction pour récupérer l'URL du PDF depuis une page de chapitre
-    function fetchPdfUrl(chapterUrl) {
+    // Langue courante de la page (fr par défaut)
+    function getPageLang() {
+        const lang = new URLSearchParams(window.location.search).get('lang');
+        return lang || 'fr';
+    }
+
+    // URL PDF directe Cairn (revues et ouvrages accessibles)
+    function buildDirectPdfUrl(articleId) {
+        return `https://shs.cairn.info/article/${articleId}/pdf?lang=${getPageLang()}`;
+    }
+
+    // Normaliser une URL relative ou absolue Cairn
+    function normalizeCairnUrl(href) {
+        if (!href) return null;
+        let url = href.replace(/&amp;/g, '&');
+        if (url.startsWith('/')) {
+            url = `https://shs.cairn.info${url}`;
+        } else if (!url.startsWith('http')) {
+            url = `https://shs.cairn.info/${url}`;
+        }
+        return url;
+    }
+
+    // Extraire une URL PDF depuis un document HTML de chapitre/article
+    function extractPdfUrlFromDocument(doc) {
+        // Méthode 1: lien caché feuilleteur (ouvrages)
+        const pdfLink = doc.getElementById('feuilleteur-url-pdf');
+        if (pdfLink && pdfLink.getAttribute('href')) {
+            return normalizeCairnUrl(pdfLink.getAttribute('href'));
+        }
+
+        // Méthode 2: window.parametersViewer dans les scripts
+        const scriptTags = doc.querySelectorAll('script');
+        for (let script of scriptTags) {
+            const content = script.textContent || '';
+            const match = content.match(/window\.parametersViewer\s*=\s*\{[^}]*file:\s*['"]([^'"]+)['"]/);
+            if (match) {
+                return normalizeCairnUrl(match[1]);
+            }
+        }
+
+        // Méthode 3: liens pdf-feuilleteur (ouvrages)
+        const feuilleteurLinks = doc.querySelectorAll('a[href*="pdf-feuilleteur"]');
+        if (feuilleteurLinks.length > 0) {
+            return normalizeCairnUrl(feuilleteurLinks[0].getAttribute('href'));
+        }
+
+        // Méthode 4: bouton PDF direct des revues/articles (/article/ID/pdf)
+        const directPdfLinks = doc.querySelectorAll('a[href*="/article/"][href*="/pdf"]');
+        for (let link of directPdfLinks) {
+            const href = link.getAttribute('href') || '';
+            // Éviter les liens vers pdf-feuilleteur déjà gérés plus haut
+            if (href.includes('/pdf') && !href.includes('pdf-feuilleteur')) {
+                return normalizeCairnUrl(href);
+            }
+        }
+
+        // Méthode 5: construire depuis un ID article trouvé dans la page
+        const articleIdElements = doc.querySelectorAll('[x-alt-clipboard]');
+        for (let el of articleIdElements) {
+            const articleId = el.getAttribute('x-alt-clipboard');
+            // IDs article du type CITE_030_0003 (pas seulement le numéro de revue CITE_030)
+            if (articleId && /^[A-Z][A-Z0-9]*_\d+_\d+$/i.test(articleId)) {
+                return buildDirectPdfUrl(articleId);
+            }
+        }
+
+        return null;
+    }
+
+    function isPdfBuffer(buffer) {
+        if (!buffer) return false;
+        const bytes = buffer instanceof Uint8Array ? buffer : new Uint8Array(buffer);
+        return bytes.length >= 5 &&
+            bytes[0] === 0x25 && bytes[1] === 0x50 &&
+            bytes[2] === 0x44 && bytes[3] === 0x46 && bytes[4] === 0x2D; // %PDF-
+    }
+
+    function resolvePdfUrl(chapter) {
+        if (chapter.articleId) {
+            return buildDirectPdfUrl(chapter.articleId);
+        }
+        throw new Error('ID article manquant pour construire l\'URL PDF');
+    }
+
+    function getDownloadMode() {
+        try {
+            if (typeof GM_info !== 'undefined' && GM_info.downloadMode) {
+                return GM_info.downloadMode; // 'browser' | 'native' | 'disabled'
+            }
+        } catch (e) { /* ignore */ }
+        return 'unknown';
+    }
+
+    /**
+     * Vrai téléchargement disque via l'API Downloads du navigateur (Tampermonkey).
+     * Ce n'est PAS un fetch/XHR page: DataDome ne le traite pas comme les XHR en 403.
+     * Prérequis Tampermonkey: Options → Downloads → Download Mode = "Browser API"
+     * et extension .pdf autorisée.
+     */
+    function downloadWithGmDownload(pdfUrl, filename, referer) {
         return new Promise((resolve, reject) => {
+            if (typeof GM_download !== 'function') {
+                reject(new Error('GM_download indisponible (installez Tampermonkey/Violentmonkey)'));
+                return;
+            }
+
+            const mode = getDownloadMode();
+            if (mode === 'disabled') {
+                reject(new Error(
+                    'Téléchargements désactivés dans Tampermonkey. ' +
+                    'Options → Downloads → Download Mode = Browser API'
+                ));
+                return;
+            }
+
+            const details = {
+                url: pdfUrl,
+                name: filename,
+                saveAs: false,
+                conflictAction: 'uniquify',
+                headers: {
+                    'Accept': 'application/pdf,*/*;q=0.9',
+                    'Referer': referer || window.location.href
+                },
+                onload: function() {
+                    resolve('gm');
+                },
+                ontimeout: function() {
+                    reject(new Error('Timeout GM_download'));
+                },
+                onerror: function(err) {
+                    const code = (err && err.error) || 'not_succeeded';
+                    let hint = code;
+                    if (code === 'not_enabled' || code === 'not_permitted') {
+                        hint = code + ' — activez Browser API dans Tampermonkey → Options → Downloads';
+                    } else if (code === 'not_whitelisted') {
+                        hint = code + ' — ajoutez .pdf aux extensions autorisées (Tampermonkey → Downloads)';
+                    }
+                    reject(new Error('GM_download: ' + hint));
+                }
+            };
+
+            try {
+                GM_download(details);
+            } catch (e) {
+                reject(e);
+            }
+        });
+    }
+
+    /**
+     * Fallback same-origin: <a download> sans nouvel onglet.
+     * Le navigateur enregistre le fichier au lieu de l'ouvrir.
+     */
+    function downloadWithAnchorAttribute(pdfUrl, filename) {
+        return new Promise((resolve) => {
+            const a = document.createElement('a');
+            a.href = pdfUrl;
+            a.setAttribute('download', filename);
+            a.style.display = 'none';
+            document.body.appendChild(a);
+            a.click();
+            a.remove();
+            // Pas de confirmation réseau fiable ici; on considère le déclenchement OK
+            setTimeout(() => resolve('anchor'), 300);
+        });
+    }
+
+    // Télécharge un PDF sur le disque (sans ouvrir d'onglet)
+    async function downloadPdfToDisk(pdfUrl, filename, referer) {
+        try {
+            return await downloadWithGmDownload(pdfUrl, filename, referer);
+        } catch (gmError) {
+            // Fallback si GM_download non configuré
+            console.warn('[Cairn PDF]', gmError.message, '→ fallback <a download>');
+            await downloadWithAnchorAttribute(pdfUrl, filename);
+            return 'anchor-fallback:' + gmError.message;
+        }
+    }
+
+    /**
+     * Récupère le PDF en mémoire (pour fusion uniquement) via GM_xmlhttpRequest.
+     * Peut échouer en 403 DataDome — dans ce cas on télécharge fichier par fichier.
+     */
+    function gmFetchPdfBlob(pdfUrl, referer) {
+        return new Promise((resolve, reject) => {
+            if (typeof GM_xmlhttpRequest !== 'function') {
+                reject(new Error('GM_xmlhttpRequest indisponible'));
+                return;
+            }
             GM_xmlhttpRequest({
                 method: 'GET',
-                url: chapterUrl,
+                url: pdfUrl,
+                responseType: 'arraybuffer',
                 headers: {
-                    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8'
+                    'Accept': 'application/pdf,*/*',
+                    'Referer': referer || window.location.href
                 },
-                onload: function(response) {
-                    try {
-                        // Parser le HTML pour trouver le lien PDF
-                        const parser = new DOMParser();
-                        const doc = parser.parseFromString(response.responseText, 'text/html');
-                        
-                        // Méthode 1: Chercher le lien caché feuilleteur-url-pdf (méthode principale)
-                        const pdfLink = doc.getElementById('feuilleteur-url-pdf');
-                        if (pdfLink) {
-                            let pdfUrl = pdfLink.getAttribute('href');
-                            if (pdfUrl) {
-                                // Décoder les entités HTML (&amp; -> &)
-                                pdfUrl = pdfUrl.replace(/&amp;/g, '&');
-                                resolve(pdfUrl);
-                                return;
-                            }
-                        }
-                        
-                        // Méthode 2: Chercher dans window.parametersViewer dans les scripts
-                        const scriptTags = doc.querySelectorAll('script');
-                        for (let script of scriptTags) {
-                            const content = script.textContent;
-                            // Pattern pour window.parametersViewer = { file: "url" }
-                            const match = content.match(/window\.parametersViewer\s*=\s*\{[^}]*file:\s*['"]([^'"]+)['"]/);
-                            if (match) {
-                                let pdfUrl = match[1].replace(/&amp;/g, '&');
-                                resolve(pdfUrl);
-                                return;
-                            }
-                            
-                            // Pattern alternatif: file: document.getElementById('feuilleteur-url-pdf').href
-                            const match2 = content.match(/file:\s*document\.getElementById\(['"]feuilleteur-url-pdf['"]\)\.href/);
-                            if (match2) {
-                                const link = doc.getElementById('feuilleteur-url-pdf');
-                                if (link && link.getAttribute('href')) {
-                                    let pdfUrl = link.getAttribute('href').replace(/&amp;/g, '&');
-                                    resolve(pdfUrl);
-                                    return;
-                                }
-                            }
-                        }
-                        
-                        // Méthode 3: Chercher tous les liens contenant "pdf-feuilleteur"
-                        const allLinks = doc.querySelectorAll('a[href*="pdf-feuilleteur"]');
-                        if (allLinks.length > 0) {
-                            let pdfUrl = allLinks[0].getAttribute('href').replace(/&amp;/g, '&');
-                            resolve(pdfUrl);
-                            return;
-                        }
-                        
-                        // Méthode 4: Construire l'URL à partir de l'ID de l'article si on le trouve
-                        const articleIdMatch = chapterUrl.match(/article\/([A-Z_0-9]+)/) || 
-                                               chapterUrl.match(/page-(\d+)/);
-                        if (articleIdMatch) {
-                            // Essayer de trouver l'ID complet de l'article dans la page
-                            const articleIdElements = doc.querySelectorAll('[x-alt-clipboard]');
-                            for (let el of articleIdElements) {
-                                const articleId = el.getAttribute('x-alt-clipboard');
-                                if (articleId && articleId.match(/^[A-Z_0-9]+$/)) {
-                                    // Construire l'URL du PDF (sans signature, on essaiera)
-                                    const baseUrl = chapterUrl.split('?')[0].replace(/\/page-\d+.*$/, '');
-                                    const pdfUrl = `https://shs.cairn.info/article/${articleId}/pdf-feuilleteur?lang=fr`;
-                                    resolve(pdfUrl);
-                                    return;
-                                }
-                            }
-                        }
-                        
-                        reject(new Error('URL PDF non trouvée sur la page'));
-                    } catch (error) {
-                        reject(new Error(`Erreur lors de l'extraction: ${error.message}`));
+                onload: function(res) {
+                    if (res.status < 200 || res.status >= 300) {
+                        reject(new Error('HTTP ' + res.status));
+                        return;
                     }
+                    if (!isPdfBuffer(res.response)) {
+                        reject(new Error('Réponse non-PDF'));
+                        return;
+                    }
+                    resolve(new Blob([res.response], { type: 'application/pdf' }));
                 },
-                onerror: function(error) {
-                    reject(new Error(`Erreur HTTP: ${error.status} ${error.statusText}`));
+                onerror: function() {
+                    reject(new Error('Erreur réseau GM_xmlhttpRequest'));
+                },
+                ontimeout: function() {
+                    reject(new Error('Timeout GM_xmlhttpRequest'));
                 }
             });
         });
     }
 
-    // Fonction pour télécharger un PDF
-    function downloadPdf(pdfUrl, filename) {
-        return new Promise((resolve, reject) => {
-            GM_download({
-                url: pdfUrl,
-                name: filename,
-                saveAs: false,
-                onload: function() {
-                    resolve();
-                },
-                onerror: function(error) {
-                    // Si l'erreur est liée à l'URL, essayer de télécharger via fetch
-                    if (error.error === 'NOT_ALLOWED' || error.error === 'FAILURE') {
-                        // Essayer avec fetch + blob
-                        fetch(pdfUrl)
-                            .then(response => {
-                                if (!response.ok) throw new Error(`HTTP ${response.status}`);
-                                return response.blob();
-                            })
-                            .then(blob => {
-                                const blobUrl = URL.createObjectURL(blob);
-                                const a = document.createElement('a');
-                                a.href = blobUrl;
-                                a.download = filename;
-                                document.body.appendChild(a);
-                                a.click();
-                                document.body.removeChild(a);
-                                URL.revokeObjectURL(blobUrl);
-                                resolve();
-                            })
-                            .catch(fetchError => {
-                                reject(new Error(`Échec du téléchargement: ${error.error || error.message || 'Erreur inconnue'}`));
-                            });
-                    } else {
-                        reject(new Error(`Échec du téléchargement: ${error.error || error.message || 'Erreur inconnue'}`));
-                    }
-                }
-            });
-        });
+    async function canFetchPdfsForMerge(sampleUrl, referer) {
+        try {
+            await gmFetchPdfBlob(sampleUrl, referer);
+            return true;
+        } catch (e) {
+            return false;
+        }
     }
 
     // Fonction pour nettoyer le nom de fichier
@@ -310,118 +408,119 @@
         });
     }
 
-    // Fonction pour fusionner plusieurs PDFs en utilisant une injection dans la page
+    // Fusion via pdf-lib dans le contexte page (buffers passés par unsafeWindow, signal via postMessage)
     async function mergePdfs(pdfBlobs, chapterLinks) {
-        // D'abord charger pdf-lib dans la page
         await loadPdfLib();
-        
-        // Convertir les blobs en ArrayBuffer pour les passer à la fonction de fusion
-        const pdfArrayBuffers = [];
-        for (let i = 0; i < pdfBlobs.length; i++) {
-            const arrayBuffer = await pdfBlobs[i].blob.arrayBuffer();
-            pdfArrayBuffers.push({
-                data: Array.from(new Uint8Array(arrayBuffer)),
-                title: pdfBlobs[i].title
-            });
-        }
-        
-        // Générer le nom du fichier fusionné
+
         const pageTitle = document.title.replace(/\s*-\s*Cairn\.info.*$/i, '').trim();
         const mergedFilename = sanitizeFilename(`${pageTitle || 'Livre_Cairn'}_complet.pdf`);
-        
-        // Créer un ID unique pour cette fusion
         const mergeId = 'cairn_merge_' + Date.now();
-        
-        // Injecter la fonction de fusion dans la page où pdf-lib est accessible
+        const pageWindow = (typeof unsafeWindow !== 'undefined' && unsafeWindow) ? unsafeWindow : window;
+
+        // Éviter JSON.stringify d'octets (très lent / lourd pour ~10–20 Mo)
+        const buffers = [];
+        for (let i = 0; i < pdfBlobs.length; i++) {
+            buffers.push(await pdfBlobs[i].blob.arrayBuffer());
+        }
+        pageWindow.__cairnMergeData = pageWindow.__cairnMergeData || {};
+        pageWindow.__cairnMergeData[mergeId] = {
+            buffers: buffers,
+            filename: mergedFilename
+        };
+
         return new Promise((resolve, reject) => {
+            const timeoutMs = Math.max(180000, pdfBlobs.length * 15000); // 3 min min, +15s/PDF
+            const timeoutId = setTimeout(() => {
+                cleanup();
+                reject(new Error('Timeout: la fusion a pris trop de temps'));
+            }, timeoutMs);
+
+            function onMessage(event) {
+                const data = event.data;
+                if (!data || data.source !== 'cairn-pdf-downloader-merge' || data.id !== mergeId) {
+                    return;
+                }
+                cleanup();
+                if (data.error) {
+                    reject(new Error(data.error));
+                } else {
+                    resolve(data);
+                }
+            }
+
+            function cleanup() {
+                clearTimeout(timeoutId);
+                window.removeEventListener('message', onMessage);
+                try {
+                    if (pageWindow.__cairnMergeData) {
+                        delete pageWindow.__cairnMergeData[mergeId];
+                    }
+                } catch (e) { /* ignore */ }
+            }
+
+            window.addEventListener('message', onMessage);
+
             const mergeScript = document.createElement('script');
             mergeScript.textContent = `
-                (function() {
-                    // Chercher PDFDocument de différentes façons
-                    let PDFDocument = null;
-                    if (window.pdfLib && window.pdfLib.PDFDocument) {
-                        PDFDocument = window.pdfLib.PDFDocument;
-                    } else if (window.pdfLib && window.pdfLib.default && window.pdfLib.default.PDFDocument) {
-                        PDFDocument = window.pdfLib.default.PDFDocument;
-                    } else if (window.PDFLib && window.PDFLib.PDFDocument) {
-                        PDFDocument = window.PDFLib.PDFDocument;
-                    } else if (window.PDFDocument) {
-                        PDFDocument = window.PDFDocument;
-                    }
-                    
-                    if (!PDFDocument || typeof PDFDocument.create !== 'function') {
-                        window.dispatchEvent(new CustomEvent('${mergeId}_error', { 
-                            detail: 'PDFDocument non disponible dans pdf-lib' 
-                        }));
-                        return;
-                    }
-                    const pdfData = ${JSON.stringify(pdfArrayBuffers)};
-                    const filename = ${JSON.stringify(mergedFilename)};
-                    
-                    (async function() {
-                        try {
-                            const mergedPdf = await PDFDocument.create();
-                            let totalPages = 0;
-                            
-                            for (let i = 0; i < pdfData.length; i++) {
-                                const arrayBuffer = new Uint8Array(pdfData[i].data).buffer;
-                                const pdf = await PDFDocument.load(arrayBuffer);
-                                const pages = await mergedPdf.copyPages(pdf, pdf.getPageIndices());
-                                pages.forEach((page) => {
-                                    mergedPdf.addPage(page);
-                                });
-                                totalPages += pdf.getPageCount();
-                            }
-                            
-                            const mergedPdfBytes = await mergedPdf.save();
-                            
-                            // Créer un blob et déclencher le téléchargement
-                            const blob = new Blob([mergedPdfBytes], { type: 'application/pdf' });
-                            const blobUrl = URL.createObjectURL(blob);
-                            const a = document.createElement('a');
-                            a.href = blobUrl;
-                            a.download = filename;
-                            document.body.appendChild(a);
-                            a.click();
-                            document.body.removeChild(a);
-                            URL.revokeObjectURL(blobUrl);
-                            
-                            window.dispatchEvent(new CustomEvent('${mergeId}_success', { 
-                                detail: { filename: filename, pages: totalPages } 
-                            }));
-                        } catch (error) {
-                            window.dispatchEvent(new CustomEvent('${mergeId}_error', { 
-                                detail: error.message 
-                            }));
+                (async function() {
+                    var id = ${JSON.stringify(mergeId)};
+                    try {
+                        var store = window.__cairnMergeData && window.__cairnMergeData[id];
+                        if (!store || !store.buffers || !store.buffers.length) {
+                            throw new Error('Données de fusion introuvables');
                         }
-                    })();
+                        var PDFDocument = null;
+                        if (window.pdfLib && window.pdfLib.PDFDocument) {
+                            PDFDocument = window.pdfLib.PDFDocument;
+                        } else if (window.pdfLib && window.pdfLib.default && window.pdfLib.default.PDFDocument) {
+                            PDFDocument = window.pdfLib.default.PDFDocument;
+                        } else if (window.PDFLib && window.PDFLib.PDFDocument) {
+                            PDFDocument = window.PDFLib.PDFDocument;
+                        } else if (window.PDFDocument) {
+                            PDFDocument = window.PDFDocument;
+                        }
+                        if (!PDFDocument || typeof PDFDocument.create !== 'function') {
+                            throw new Error('PDFDocument non disponible dans pdf-lib');
+                        }
+
+                        var mergedPdf = await PDFDocument.create();
+                        var totalPages = 0;
+                        for (var i = 0; i < store.buffers.length; i++) {
+                            var pdf = await PDFDocument.load(store.buffers[i]);
+                            var pages = await mergedPdf.copyPages(pdf, pdf.getPageIndices());
+                            pages.forEach(function(page) { mergedPdf.addPage(page); });
+                            totalPages += pdf.getPageCount();
+                        }
+
+                        var mergedPdfBytes = await mergedPdf.save();
+                        var blob = new Blob([mergedPdfBytes], { type: 'application/pdf' });
+                        var blobUrl = URL.createObjectURL(blob);
+                        var a = document.createElement('a');
+                        a.href = blobUrl;
+                        a.download = store.filename;
+                        document.body.appendChild(a);
+                        a.click();
+                        document.body.removeChild(a);
+                        URL.revokeObjectURL(blobUrl);
+
+                        window.postMessage({
+                            source: 'cairn-pdf-downloader-merge',
+                            id: id,
+                            ok: true,
+                            pages: totalPages,
+                            filename: store.filename
+                        }, '*');
+                    } catch (e) {
+                        window.postMessage({
+                            source: 'cairn-pdf-downloader-merge',
+                            id: id,
+                            error: String(e && e.message ? e.message : e)
+                        }, '*');
+                    }
                 })();
             `;
-            
-            const successHandler = (e) => {
-                window.removeEventListener(`${mergeId}_success`, successHandler);
-                window.removeEventListener(`${mergeId}_error`, errorHandler);
-                resolve();
-            };
-            
-            const errorHandler = (e) => {
-                window.removeEventListener(`${mergeId}_success`, successHandler);
-                window.removeEventListener(`${mergeId}_error`, errorHandler);
-                reject(new Error(e.detail || 'Erreur lors de la fusion'));
-            };
-            
-            window.addEventListener(`${mergeId}_success`, successHandler);
-            window.addEventListener(`${mergeId}_error`, errorHandler);
-            
-            // Timeout de sécurité
-            setTimeout(() => {
-                window.removeEventListener(`${mergeId}_success`, successHandler);
-                window.removeEventListener(`${mergeId}_error`, errorHandler);
-                reject(new Error('Timeout: la fusion a pris trop de temps'));
-            }, 60000); // 60 secondes pour fusionner
-            
-            // Injecter le script dans la page
             (document.head || document.documentElement).appendChild(mergeScript);
+            mergeScript.remove();
         });
     }
 
@@ -437,13 +536,8 @@
             const href = link.getAttribute('href');
             if (!href || !href.includes('page-')) return;
             
-            // Normaliser l'URL et s'assurer qu'on est sur l'onglet feuilleteur si nécessaire
+            // Normaliser l'URL (pas de tab=feuilleteur: les revues n'en ont pas et DataDome bloque ce XHR)
             let fullUrl = href.startsWith('http') ? href : `https://shs.cairn.info${href}`;
-            
-            // Ajouter ?tab=feuilleteur si ce n'est pas déjà présent (nécessaire pour certaines pages)
-            if (!fullUrl.includes('tab=')) {
-                fullUrl += (fullUrl.includes('?') ? '&' : '?') + 'tab=feuilleteur';
-            }
             
             // Ignorer si déjà traité
             if (seenUrls.has(fullUrl)) return;
@@ -541,269 +635,265 @@
         return links;
     }
 
-    // Fonction principale pour télécharger tous les chapitres
+    const DEFAULT_BTN_LABEL = 'Télécharger et fusionner tous les PDF';
+
+    function setButtonState(button, { busy = false, label = DEFAULT_BTN_LABEL, progress = '' } = {}) {
+        if (!button) return;
+        button.disabled = !!busy;
+        button.setAttribute('aria-busy', busy ? 'true' : 'false');
+        button.setAttribute('aria-label', label);
+        button.setAttribute('title', label);
+        button.classList.toggle('opacity-60', !!busy);
+        button.classList.toggle('pointer-events-none', !!busy);
+
+        let badge = button.querySelector('.cairn-dl-badge');
+        if (progress) {
+            if (!badge) {
+                badge = document.createElement('span');
+                badge.className = 'cairn-dl-badge';
+                badge.setAttribute('aria-hidden', 'true');
+                badge.style.cssText = [
+                    'position:absolute', 'bottom:-2px', 'right:-4px', 'z-index:2',
+                    'min-width:16px', 'height:16px', 'padding:0 4px',
+                    'border-radius:999px', 'background:#0b57a4', 'color:#fff',
+                    'font-size:9px', 'line-height:16px', 'font-weight:700',
+                    'font-family:system-ui,sans-serif'
+                ].join(';');
+                button.style.position = 'relative';
+                button.appendChild(badge);
+            }
+            badge.textContent = progress;
+            badge.hidden = false;
+        } else if (badge) {
+            badge.hidden = true;
+            badge.textContent = '';
+        }
+    }
+
+    function showToast(message, isError = false) {
+        const existing = document.getElementById('cairn-dl-toast');
+        if (existing) existing.remove();
+
+        const toast = document.createElement('div');
+        toast.id = 'cairn-dl-toast';
+        toast.setAttribute('role', 'status');
+        toast.textContent = message;
+        toast.style.cssText = [
+            'position:fixed', 'bottom:24px', 'right:24px', 'z-index:100001',
+            'max-width:360px', 'padding:12px 16px', 'border-radius:10px',
+            'font:14px/1.4 system-ui,sans-serif', 'color:#fff',
+            `background:${isError ? '#b42318' : '#0b57a4'}`,
+            'box-shadow:0 8px 24px rgba(0,0,0,.2)'
+        ].join(';');
+        document.body.appendChild(toast);
+        setTimeout(() => toast.remove(), isError ? 8000 : 4500);
+    }
+
+    // Télécharge + fusionne directement (pas de popup)
     async function downloadAllChapters() {
         const chapterLinks = findChapterLinks();
-        
         if (chapterLinks.length === 0) {
-            alert('Aucun chapitre trouvé sur cette page.');
+            showToast('Aucun chapitre trouvé sur cette page.', true);
             return;
         }
-
-        const confirmMessage = `Trouvé ${chapterLinks.length} chapitre(s). Voulez-vous les télécharger tous ?\n\nCela peut prendre plusieurs minutes.`;
-        
-        // Créer une modal personnalisée pour la confirmation (plus fiable que confirm())
-        const modal = document.createElement('div');
-        modal.style.cssText = `
-            position: fixed;
-            top: 0;
-            left: 0;
-            width: 100%;
-            height: 100%;
-            background: rgba(0,0,0,0.5);
-            z-index: 100000;
-            display: flex;
-            align-items: center;
-            justify-content: center;
-        `;
-        
-        const modalContent = document.createElement('div');
-        modalContent.style.cssText = `
-            background: white;
-            padding: 30px;
-            border-radius: 10px;
-            max-width: 500px;
-            box-shadow: 0 4px 20px rgba(0,0,0,0.3);
-        `;
-        
-        modalContent.innerHTML = `
-            <h2 style="margin-top: 0;">Télécharger tous les chapitres</h2>
-            <p>${confirmMessage}</p>
-            <div style="margin: 20px 0;">
-                <label style="display: flex; align-items: center; gap: 10px; cursor: pointer;">
-                    <input type="checkbox" id="cairn-merge-pdfs" checked style="width: 18px; height: 18px; cursor: pointer;">
-                    <span>Fusionner tous les PDFs en un seul fichier (dans le bon ordre)</span>
-                </label>
-            </div>
-            <div style="display: flex; gap: 10px; justify-content: flex-end; margin-top: 20px;">
-                <button id="cairn-confirm-cancel" style="padding: 10px 20px; background: #ccc; border: none; border-radius: 5px; cursor: pointer;">Annuler</button>
-                <button id="cairn-confirm-ok" style="padding: 10px 20px; background: #0066cc; color: white; border: none; border-radius: 5px; cursor: pointer; font-weight: bold;">Télécharger</button>
-            </div>
-        `;
-        
-        modal.appendChild(modalContent);
-        document.body.appendChild(modal);
-        
-        // Gérer la confirmation avec une promesse
-        const userChoice = await new Promise((resolve) => {
-            const okBtn = document.getElementById('cairn-confirm-ok');
-            const cancelBtn = document.getElementById('cairn-confirm-cancel');
-            
-            okBtn.addEventListener('click', () => {
-                const mergePdfs = document.getElementById('cairn-merge-pdfs').checked;
-                document.body.removeChild(modal);
-                resolve({ confirmed: true, mergePdfs: mergePdfs });
-            });
-            
-            cancelBtn.addEventListener('click', () => {
-                document.body.removeChild(modal);
-                resolve({ confirmed: false, mergePdfs: false });
-            });
-            
-            // Fermer en cliquant en dehors
-            modal.addEventListener('click', (e) => {
-                if (e.target === modal) {
-                    document.body.removeChild(modal);
-                    resolve({ confirmed: false, mergePdfs: false });
-                }
-            });
-        });
-        
-        if (!userChoice.confirmed) {
-            return;
-        }
-        
-        const shouldMerge = userChoice.mergePdfs;
 
         const button = document.getElementById('cairn-download-all-btn');
-        if (button) {
-            button.disabled = true;
-            button.textContent = shouldMerge ? 
-                `Récupération des PDFs... (0/${chapterLinks.length})` : 
-                `Téléchargement en cours... (0/${chapterLinks.length})`;
+        if (button && button.getAttribute('aria-busy') === 'true') {
+            return;
         }
 
+        setButtonState(button, {
+            busy: true,
+            label: `Préparation (${chapterLinks.length} PDF)...`,
+            progress: `0/${chapterLinks.length}`
+        });
+
+        let shouldMerge = true;
         let successCount = 0;
         let errorCount = 0;
         const errors = [];
-        const pdfBlobs = []; // Pour stocker les PDFs en mémoire si fusion
+        const pdfBlobs = [];
+
+        // Toujours viser la fusion; bascule disque si DataDome bloque la lecture mémoire
+        const probeUrl = resolvePdfUrl(chapterLinks[0]);
+        const probeReferer = chapterLinks[0].url || window.location.href;
+        const canMerge = await canFetchPdfsForMerge(probeUrl, probeReferer);
+        if (!canMerge) {
+            shouldMerge = false;
+            showToast('Fusion mémoire impossible (403). Téléchargement fichier par fichier…');
+        }
 
         for (let i = 0; i < chapterLinks.length; i++) {
             const chapter = chapterLinks[i];
-            
             try {
-                // Mettre à jour le statut
-                if (button) {
-                    button.textContent = shouldMerge ?
-                        `Récupération PDF ${i + 1}/${chapterLinks.length}...` :
-                        `Récupération PDF ${i + 1}/${chapterLinks.length}...`;
-                }
-
-                // Récupérer l'URL du PDF
-                const pdfUrl = await fetchPdfUrl(chapter.url);
-                
-                // Attendre avant de télécharger
-                await new Promise(resolve => setTimeout(resolve, DELAY_BETWEEN_DOWNLOADS));
-
-                // Générer le nom de fichier
+                const pdfUrl = resolvePdfUrl(chapter);
                 const filename = sanitizeFilename(`${chapter.title || `Chapitre-${i + 1}`}.pdf`);
+                const referer = chapter.url || window.location.href;
+                const progress = `${i + 1}/${chapterLinks.length}`;
+
+                setButtonState(button, {
+                    busy: true,
+                    label: shouldMerge
+                        ? `Récupération PDF ${progress}…`
+                        : `Téléchargement ${progress}…`,
+                    progress
+                });
 
                 if (shouldMerge) {
-                    // Télécharger en mémoire pour fusionner
-                    if (button) {
-                        button.textContent = `Téléchargement ${i + 1}/${chapterLinks.length} en mémoire...`;
-                    }
-                    
-                    const response = await fetch(pdfUrl);
-                    if (!response.ok) throw new Error(`HTTP ${response.status}`);
-                    const blob = await response.blob();
-                    pdfBlobs.push({ blob: blob, title: chapter.title || `Chapitre ${i + 1}` });
-                    successCount++;
+                    const blob = await gmFetchPdfBlob(pdfUrl, referer);
+                    pdfBlobs.push({ blob, title: chapter.title || `Chapitre ${i + 1}` });
                 } else {
-                    // Télécharger normalement
-                    if (button) {
-                        button.textContent = `Téléchargement ${i + 1}/${chapterLinks.length}: ${filename}`;
-                    }
-                    await downloadPdf(pdfUrl, filename);
-                    successCount++;
+                    await downloadPdfToDisk(pdfUrl, filename, referer);
                 }
+                successCount++;
 
-                // Délai entre chaque chapitre (sauf pour le dernier)
                 if (i < chapterLinks.length - 1) {
-                    await new Promise(resolve => setTimeout(resolve, DELAY_BETWEEN_PAGE_FETCHES));
+                    await new Promise(resolve => setTimeout(resolve, DELAY_BETWEEN_DOWNLOADS));
                 }
-
             } catch (error) {
                 errorCount++;
-                const errorMsg = `Erreur pour ${chapter.title || chapter.url}: ${error.message}`;
-                errors.push(errorMsg);
+                errors.push(`${chapter.title || chapter.url}: ${error.message}`);
             }
         }
 
-        // Fusionner les PDFs si demandé
         if (shouldMerge && pdfBlobs.length > 0) {
-            if (button) {
-                button.textContent = 'Fusion des PDFs en cours...';
-            }
+            setButtonState(button, {
+                busy: true,
+                label: 'Fusion du PDF complet…',
+                progress: '∑'
+            });
             try {
                 await mergePdfs(pdfBlobs, chapterLinks);
             } catch (error) {
-                errors.push(`Erreur lors de la fusion: ${error.message}`);
+                errors.push(`Fusion: ${error.message}`);
+                // Secours: enregistrer les blobs individuellement
+                for (let i = 0; i < pdfBlobs.length; i++) {
+                    const filename = sanitizeFilename(`${pdfBlobs[i].title || `Chapitre-${i + 1}`}.pdf`);
+                    try {
+                        const blobUrl = URL.createObjectURL(pdfBlobs[i].blob);
+                        const a = document.createElement('a');
+                        a.href = blobUrl;
+                        a.download = filename;
+                        document.body.appendChild(a);
+                        a.click();
+                        a.remove();
+                        setTimeout(() => URL.revokeObjectURL(blobUrl), 1000);
+                    } catch (e) {
+                        errors.push(`Secours ${filename}: ${e.message}`);
+                    }
+                }
             }
         }
 
-        // Message final
-        if (button) {
-            button.disabled = false;
-            button.textContent = 'Télécharger tous les chapitres';
-        }
+        setButtonState(button, { busy: false, label: DEFAULT_BTN_LABEL, progress: '' });
 
-        let message = `Téléchargement terminé !\n\n`;
-        message += `✓ Réussis: ${successCount}\n`;
-        message += `✗ Échecs: ${errorCount}\n`;
-        
-        if (errors.length > 0) {
-            message += `\nErreurs:\n${errors.join('\n')}`;
+        if (errors.length === 0) {
+            showToast(
+                shouldMerge
+                    ? `PDF fusionné prêt (${successCount} articles).`
+                    : `${successCount} PDF téléchargés.`
+            );
+        } else {
+            showToast(
+                `Terminé: ${successCount} OK, ${errorCount + (errors.some(e => e.startsWith('Fusion:')) ? 0 : 0)} erreur(s). ${errors[0]}`,
+                true
+            );
+            console.warn('[Cairn PDF] Erreurs:', errors);
         }
-
-        alert(message);
     }
 
-    // Fonction pour ajouter le bouton sur la page principale
-    function addDownloadButton() {
-        // Vérifier si on est sur une page principale (pas une page de chapitre)
-        // Les pages de chapitres ont "page-XX" dans l'URL (sauf page-1 qui peut être la page de début)
-        const url = window.location.href;
-        const isChapterPage = /page-\d+/.test(url) && !url.includes('page-1?');
-        
-        if (isChapterPage) {
-            return; // On est sur une page de chapitre, ne pas ajouter le bouton
-        }
-        
-        // Vérifier qu'il y a des chapitres sur la page
-        const chapterLinks = findChapterLinks();
-        if (chapterLinks.length === 0) {
-            return; // Pas de chapitres trouvés, ne pas afficher le bouton
-        }
+    function createToolbarButton() {
+        const wrap = document.createElement('div');
+        wrap.id = 'cairn-download-all-wrap';
+        wrap.className = 'flex flex-row gap-2.5 text-center leading-4';
 
-        // Vérifier si le bouton existe déjà
-        if (document.getElementById('cairn-download-all-btn')) {
-            return;
-        }
-
-        // Chercher un endroit approprié pour placer le bouton
-        // Essayer de trouver la zone de navigation ou les onglets
-        const targetContainer = document.querySelector('.shadow-frame, .flex.flex-row.items-center, header, nav') 
-            || document.body;
-
-        // Créer le bouton
         const button = document.createElement('button');
         button.id = 'cairn-download-all-btn';
-        button.textContent = 'Télécharger tous les chapitres';
-        button.style.cssText = `
-            position: fixed;
-            top: 20px;
-            right: 20px;
-            z-index: 10000;
-            padding: 12px 24px;
-            background-color: #0066cc;
-            color: white;
-            border: none;
-            border-radius: 8px;
-            font-size: 14px;
-            font-weight: bold;
-            cursor: pointer;
-            box-shadow: 0 4px 6px rgba(0,0,0,0.3);
-            transition: background-color 0.3s;
+        button.type = 'button';
+        button.className = 'z-[1] group text-cairn-main';
+        button.setAttribute('aria-label', DEFAULT_BTN_LABEL);
+        button.setAttribute('title', DEFAULT_BTN_LABEL);
+        button.innerHTML = `
+            <span aria-hidden="true" class="fa-stack fa-1x group">
+                <svg aria-hidden="true" class="bfa bfa-solid inline fa-stack-2x size-[36px] text-concrete-100 group-hover:text-alto-200" fill="currentColor" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><path d="M256 512A256 256 0 1 0 256 0a256 256 0 1 0 0 512z"></path></svg>
+                <svg aria-hidden="true" class="bfa bfa-solid inline fa-stack-1x text-cairn-main font-normal size-[18px]" fill="currentColor" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><path d="M288 32c0-17.7-14.3-32-32-32s-32 14.3-32 32l0 242.7-73.4-73.4c-12.5-12.5-32.8-12.5-45.3 0s-12.5 32.8 0 45.3l128 128c12.5 12.5 32.8 12.5 45.3 0l128-128c12.5-12.5 12.5-32.8 0-45.3s-32.8-12.5-45.3 0L288 274.7 288 32zM64 352c-35.3 0-64 28.7-64 64l0 32c0 35.3 28.7 64 64 64l384 0c35.3 0 64-28.7 64-64l0-32c0-35.3-28.7-64-64-64l-101.5 0-45.3 45.3c-25 25-65.5 25-90.5 0L165.5 352 64 352zm368 56a24 24 0 1 1 0 48 24 24 0 1 1 0-48z"></path></svg>
+            </span>
         `;
-        
-        button.addEventListener('mouseenter', () => {
-            button.style.backgroundColor = '#0052a3';
-        });
-        
-        button.addEventListener('mouseleave', () => {
-            button.style.backgroundColor = '#0066cc';
-        });
 
         button.addEventListener('click', function(e) {
             e.preventDefault();
             e.stopPropagation();
-            try {
-                downloadAllChapters();
-            } catch (error) {
-                alert('Erreur: ' + error.message);
-            }
+            downloadAllChapters().catch((error) => {
+                setButtonState(button, { busy: false, label: DEFAULT_BTN_LABEL, progress: '' });
+                showToast('Erreur: ' + error.message, true);
+            });
         });
 
-        // Ajouter le bouton à la page
-        document.body.appendChild(button);
+        wrap.appendChild(button);
+        return wrap;
+    }
+
+    function findBookmarkInsertPoint() {
+        const bookmarkRoot =
+            document.querySelector('[x-data*="bookmarkButton"]') ||
+            document.querySelector('button[aria-label*="liste de lecture"]')?.closest('div');
+
+        if (bookmarkRoot && bookmarkRoot.parentElement) {
+            return { parent: bookmarkRoot.parentElement, before: bookmarkRoot };
+        }
+
+        const citeBtn = document.querySelector('button[aria-label*="Citer ce"]');
+        if (citeBtn) {
+            const citeWrap = citeBtn.closest('.flex.flex-row, .flex') || citeBtn.parentElement;
+            if (citeWrap && citeWrap.parentElement) {
+                return { parent: citeWrap.parentElement, before: citeWrap };
+            }
+        }
+
+        return null;
+    }
+
+    // Bouton intégré à gauche du bookmark (style Cairn)
+    function addDownloadButton() {
+        const url = window.location.href;
+        const isChapterPage = /page-\d+/.test(url) && !/page-1(\?|$)/.test(url);
+        if (isChapterPage) return;
+
+        const chapterLinks = findChapterLinks();
+        if (chapterLinks.length === 0) return;
+
+        if (document.getElementById('cairn-download-all-btn')) return;
+
+        const wrap = createToolbarButton();
+        const insert = findBookmarkInsertPoint();
+
+        if (insert && insert.parent) {
+            insert.parent.insertBefore(wrap, insert.before);
+            return;
+        }
+
+        // Repli si la barre d'actions n'est pas encore montée
+        wrap.style.cssText = 'position:fixed;top:20px;right:20px;z-index:10000;';
+        document.body.appendChild(wrap);
+    }
+
+    function scheduleButtonMount() {
+        addDownloadButton();
+        // La barre bookmark/citer se monte parfois après le 1er paint (Alpine/Livewire)
+        [300, 1000, 2500].forEach((ms) => setTimeout(addDownloadButton, ms));
     }
 
     // Initialiser le script
     function init() {
-        // Attendre que la page soit chargée
         if (document.readyState === 'loading') {
-            document.addEventListener('DOMContentLoaded', addDownloadButton);
+            document.addEventListener('DOMContentLoaded', scheduleButtonMount);
         } else {
-            addDownloadButton();
+            scheduleButtonMount();
         }
 
-        // Réinitialiser si la page change (pour Livewire/SPA)
-        if (typeof Livewire !== 'undefined') {
-            document.addEventListener('livewire:navigated', () => {
-                setTimeout(addDownloadButton, 500);
-            });
-        }
+        document.addEventListener('livewire:navigated', () => {
+            setTimeout(scheduleButtonMount, 300);
+        });
     }
 
     init();
