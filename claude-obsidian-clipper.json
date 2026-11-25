@@ -1,0 +1,36 @@
+{
+	"schemaVersion": "0.1.0",
+	"name": "Claude AI Discussion",
+	"behavior": "create",
+	"noteContentFormat": "{{selector:#atr-claude-md}}",
+	"properties": [
+		{
+			"name": "title",
+			"value": "{{title}}",
+			"type": "text"
+		},
+		{
+			"name": "source",
+			"value": "{{url}}",
+			"type": "text"
+		},
+		{
+			"name": "created",
+			"value": "{{date|date:\"YYYY-MM-DD\"}}",
+			"type": "date"
+		},
+		{
+			"name": "tags",
+			"value": "claude/conversation",
+			"type": "multitext"
+		}
+	],
+	"triggers": [
+		"https://claude.ai/chat/",
+		"https://claude.ai/share/",
+		"https://claude.com/chat/",
+		"https://claude.com/share/"
+	],
+	"noteNameFormat": "{{date|date:\"YYYY-MM-DD\"}} - {{title|safe_name}}",
+	"path": "Clippings/Claude"
+}
