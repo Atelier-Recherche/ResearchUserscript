@@ -1,17 +1,21 @@
 // ==UserScript==
 // @name         Cairn PDF Downloader
 // @namespace    http://tampermonkey.net/
-// @version      1.7
+// @version      1.8
 // @description  Télécharge et fusionne en un PDF tous les chapitres/articles d'un livre ou d'une revue Cairn
 // @author       You
 // @match        https://shs.cairn.info/*
 // @match        https://*.cairn.info/*
+// @match        https://shs-cairn-info.janus.bis-sorbonne.fr/*
+// @match        https://*.janus.bis-sorbonne.fr/*
 // @grant        GM_download
 // @grant        GM_xmlhttpRequest
 // @grant        unsafeWindow
 // @connect      cairn.info
 // @connect      shs.cairn.info
 // @connect      www.cairn.info
+// @connect      shs-cairn-info.janus.bis-sorbonne.fr
+// @connect      *.janus.bis-sorbonne.fr
 // @connect      cdn.jsdelivr.net
 // @connect      unpkg.com
 // ==/UserScript==
@@ -46,21 +50,40 @@
         return lang || 'fr';
     }
 
+    // Toujours rester sur l'hôte courant (proxy Janus inclus) pour garder la session
+    function getCairnOrigin() {
+        return window.location.origin;
+    }
+
+    function isCairnHostname(hostname) {
+        if (!hostname) return false;
+        return /(^|\.)cairn\.info$/i.test(hostname) ||
+            /(^|\.)janus\.bis-sorbonne\.fr$/i.test(hostname);
+    }
+
+    // Réécrit les liens cairn.info vers l'origine courante (ex: proxy Janus)
+    function toCurrentOriginUrl(href) {
+        if (!href) return null;
+        const cleaned = href.replace(/&amp;/g, '&');
+        try {
+            const u = new URL(cleaned, getCairnOrigin());
+            if (isCairnHostname(u.hostname)) {
+                return getCairnOrigin() + u.pathname + u.search + u.hash;
+            }
+            return u.href;
+        } catch (e) {
+            return null;
+        }
+    }
+
     // URL PDF directe Cairn (revues et ouvrages accessibles)
     function buildDirectPdfUrl(articleId) {
-        return `https://shs.cairn.info/article/${articleId}/pdf?lang=${getPageLang()}`;
+        return `${getCairnOrigin()}/article/${articleId}/pdf?lang=${getPageLang()}`;
     }
 
     // Normaliser une URL relative ou absolue Cairn
     function normalizeCairnUrl(href) {
-        if (!href) return null;
-        let url = href.replace(/&amp;/g, '&');
-        if (url.startsWith('/')) {
-            url = `https://shs.cairn.info${url}`;
-        } else if (!url.startsWith('http')) {
-            url = `https://shs.cairn.info/${url}`;
-        }
-        return url;
+        return toCurrentOriginUrl(href);
     }
 
     // Extraire une URL PDF depuis un document HTML de chapitre/article
@@ -222,8 +245,96 @@
     }
 
     /**
-     * Récupère le PDF en mémoire (pour fusion uniquement) via GM_xmlhttpRequest.
-     * Peut échouer en 403 DataDome — dans ce cas on télécharge fichier par fichier.
+     * Fetch same-origin dans le contexte page (cookies Janus / session navigateur).
+     * Plus fiable que GM_xmlhttpRequest sur un proxy universitaire.
+     */
+    function pageFetchPdfBlob(pdfUrl) {
+        return new Promise((resolve, reject) => {
+            const fetchId = 'cairn_fetch_' + Date.now() + '_' + Math.random().toString(36).slice(2, 9);
+            const pageWindow = (typeof unsafeWindow !== 'undefined' && unsafeWindow) ? unsafeWindow : window;
+            let settled = false;
+
+            function cleanup() {
+                window.removeEventListener('message', onMessage);
+                clearTimeout(timeoutId);
+            }
+
+            function finish(err, blob) {
+                if (settled) return;
+                settled = true;
+                cleanup();
+                if (err) reject(err);
+                else resolve(blob);
+            }
+
+            function onMessage(event) {
+                const data = event.data;
+                if (!data || data.source !== 'cairn-pdf-downloader-fetch' || data.id !== fetchId) {
+                    return;
+                }
+                if (data.error) {
+                    finish(new Error(data.error));
+                    return;
+                }
+                try {
+                    const store = pageWindow.__cairnFetchData && pageWindow.__cairnFetchData[fetchId];
+                    if (!store || !store.buffer) {
+                        finish(new Error('Buffer PDF introuvable après fetch page'));
+                        return;
+                    }
+                    const buffer = store.buffer;
+                    delete pageWindow.__cairnFetchData[fetchId];
+                    if (!isPdfBuffer(buffer)) {
+                        finish(new Error('Réponse non-PDF (fetch page)'));
+                        return;
+                    }
+                    finish(null, new Blob([buffer], { type: 'application/pdf' }));
+                } catch (e) {
+                    finish(e);
+                }
+            }
+
+            window.addEventListener('message', onMessage);
+
+            const timeoutId = setTimeout(() => {
+                finish(new Error('Timeout fetch page'));
+            }, 15000);
+
+            const mergeScript = document.createElement('script');
+            mergeScript.textContent = `
+                (async function() {
+                    var id = ${JSON.stringify(fetchId)};
+                    try {
+                        var res = await fetch(${JSON.stringify(pdfUrl)}, {
+                            credentials: 'include',
+                            headers: { 'Accept': 'application/pdf,*/*' }
+                        });
+                        if (!res.ok) throw new Error('HTTP ' + res.status);
+                        var buffer = await res.arrayBuffer();
+                        window.__cairnFetchData = window.__cairnFetchData || {};
+                        window.__cairnFetchData[id] = { buffer: buffer };
+                        window.postMessage({
+                            source: 'cairn-pdf-downloader-fetch',
+                            id: id,
+                            ok: true
+                        }, '*');
+                    } catch (e) {
+                        window.postMessage({
+                            source: 'cairn-pdf-downloader-fetch',
+                            id: id,
+                            error: String(e && e.message ? e.message : e)
+                        }, '*');
+                    }
+                })();
+            `;
+            (document.head || document.documentElement).appendChild(mergeScript);
+            mergeScript.remove();
+        });
+    }
+
+    /**
+     * Récupère le PDF en mémoire via GM_xmlhttpRequest (fallback).
+     * Peut échouer en 403 DataDome hors session proxy.
      */
     function gmFetchPdfBlob(pdfUrl, referer) {
         return new Promise((resolve, reject) => {
@@ -235,6 +346,7 @@
                 method: 'GET',
                 url: pdfUrl,
                 responseType: 'arraybuffer',
+                anonymous: false,
                 headers: {
                     'Accept': 'application/pdf,*/*',
                     'Referer': referer || window.location.href
@@ -260,12 +372,43 @@
         });
     }
 
+    async function fetchPdfBlobForMerge(pdfUrl, referer) {
+        // 1) fetch du sandbox userscript (rapide si cookies same-origin dispo)
+        try {
+            const res = await fetch(pdfUrl, {
+                credentials: 'include',
+                headers: { 'Accept': 'application/pdf,*/*' }
+            });
+            if (res.ok) {
+                const buffer = await res.arrayBuffer();
+                if (isPdfBuffer(buffer)) {
+                    return new Blob([buffer], { type: 'application/pdf' });
+                }
+                console.warn('[Cairn PDF] fetch userscript: réponse non-PDF');
+            } else {
+                console.warn('[Cairn PDF] fetch userscript: HTTP', res.status);
+            }
+        } catch (e) {
+            console.warn('[Cairn PDF] fetch userscript échoué:', e.message);
+        }
+
+        // 2) fetch dans le contexte page (cookies de session Janus)
+        try {
+            return await pageFetchPdfBlob(pdfUrl);
+        } catch (pageErr) {
+            console.warn('[Cairn PDF] fetch page échoué:', pageErr.message);
+        }
+
+        // 3) GM_xmlhttpRequest
+        return gmFetchPdfBlob(pdfUrl, referer);
+    }
+
     async function canFetchPdfsForMerge(sampleUrl, referer) {
         try {
-            await gmFetchPdfBlob(sampleUrl, referer);
-            return true;
+            await fetchPdfBlobForMerge(sampleUrl, referer);
+            return { ok: true };
         } catch (e) {
-            return false;
+            return { ok: false, reason: e && e.message ? e.message : String(e) };
         }
     }
 
@@ -536,8 +679,9 @@
             const href = link.getAttribute('href');
             if (!href || !href.includes('page-')) return;
             
-            // Normaliser l'URL (pas de tab=feuilleteur: les revues n'en ont pas et DataDome bloque ce XHR)
-            let fullUrl = href.startsWith('http') ? href : `https://shs.cairn.info${href}`;
+            // Normaliser sur l'origine courante (proxy Janus inclus)
+            const fullUrl = toCurrentOriginUrl(href);
+            if (!fullUrl || !fullUrl.includes('page-')) return;
             
             // Ignorer si déjà traité
             if (seenUrls.has(fullUrl)) return;
@@ -714,13 +858,19 @@
         const errors = [];
         const pdfBlobs = [];
 
-        // Toujours viser la fusion; bascule disque si DataDome bloque la lecture mémoire
+        // Toujours viser la fusion; bascule disque si la lecture mémoire est bloquée
         const probeUrl = resolvePdfUrl(chapterLinks[0]);
         const probeReferer = chapterLinks[0].url || window.location.href;
-        const canMerge = await canFetchPdfsForMerge(probeUrl, probeReferer);
-        if (!canMerge) {
+        const mergeProbe = await canFetchPdfsForMerge(probeUrl, probeReferer);
+        if (!mergeProbe.ok) {
             shouldMerge = false;
-            showToast('Fusion mémoire impossible (403). Téléchargement fichier par fichier…');
+            showToast(
+                `Fusion mémoire impossible (${mergeProbe.reason || 'bloqué'}). Téléchargement fichier par fichier…`,
+                true
+            );
+            console.warn('[Cairn PDF] Probe fusion échoué:', mergeProbe.reason, 'URL:', probeUrl);
+        } else {
+            console.info('[Cairn PDF] Probe fusion OK via', probeUrl);
         }
 
         for (let i = 0; i < chapterLinks.length; i++) {
@@ -740,7 +890,7 @@
                 });
 
                 if (shouldMerge) {
-                    const blob = await gmFetchPdfBlob(pdfUrl, referer);
+                    const blob = await fetchPdfBlobForMerge(pdfUrl, referer);
                     pdfBlobs.push({ blob, title: chapter.title || `Chapitre ${i + 1}` });
                 } else {
                     await downloadPdfToDisk(pdfUrl, filename, referer);
